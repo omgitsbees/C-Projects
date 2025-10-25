@@ -1,7 +1,7 @@
 #pragma once
 #include "neural_framework.h"
 #include <algorithm>
-
+ 
 // Convolution 2D Layer
 class Conv2DLayer : public Layer {
 private:
@@ -600,4 +600,5 @@ public:
     
     std::vector<Variable*> parameters() override {
         return {}; // No parameters
+
     }
