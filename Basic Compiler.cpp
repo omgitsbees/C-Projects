@@ -4,7 +4,7 @@
 #include <map>
 #include <stdexcept>
 #include <cctype>
-
+  
 // Token types for lexical analysis
 enum class TokenType {
     NUMBER,
@@ -161,4 +161,5 @@ int main() {
     }
 
     return 0;
+
 }
