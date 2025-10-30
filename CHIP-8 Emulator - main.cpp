@@ -3,7 +3,7 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
-
+  
 constexpr int SCALE = 10;
 constexpr int SCREEN_WIDTH = Chip8::DISPLAY_WIDTH * SCALE;
 constexpr int SCREEN_HEIGHT = Chip8::DISPLAY_HEIGHT * SCALE;
@@ -294,4 +294,5 @@ int main(int argc, char* argv[]) {
     SDL_Quit();
     
     return 0;
+
 }
