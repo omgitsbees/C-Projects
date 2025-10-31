@@ -3,7 +3,7 @@
 #include <random>
 #include <cstring>
 #include <iomanip>
-
+ 
 // CHIP-8 fontset (0-F, 5 bytes each)
 static const uint8_t FONTSET[80] = {
     0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
@@ -411,4 +411,5 @@ std::string Chip8::disassemble(uint16_t opcode) const {
     
     snprintf(buf, 64, "UNKNOWN 0x%04X", opcode);
     return buf;
+
 }
