@@ -8,57 +8,119 @@
   
 #include <memory>
 #include <stdexcept>
+#include <mutex>
+#include <string>
+#include <vector>
+
+// Forward declarations for CPU types
+class Tensor;
+class Variable;
+
+// Macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            throw std::runtime_error(std::string("CUDA error at ") + __FILE__ + ":" + \
+                                   std::to_string(__LINE__) + " - " + \
+                                   cudaGetErrorString(err)); \
+        } \
+    } while(0)
+
+#define CUBLAS_CHECK(call) \
+    do { \
+        cublasStatus_t stat = call; \
+        if (stat != CUBLAS_STATUS_SUCCESS) { \
+            throw std::runtime_error(std::string("cuBLAS error at ") + __FILE__ + ":" + \
+                                   std::to_string(__LINE__)); \
+        } \
+    } while(0)
+
+#define CUDNN_CHECK(call) \
+    do { \
+        cudnnStatus_t stat = call; \
+        if (stat != CUDNN_STATUS_SUCCESS) { \
+            throw std::runtime_error(std::string("cuDNN error at ") + __FILE__ + ":" + \
+                                   std::to_string(__LINE__) + " - " + \
+                                   cudnnGetErrorString(stat)); \
+        } \
+    } while(0)
+
+// Configuration constants
+namespace CudaConfig {
+    constexpr int DEFAULT_BLOCK_SIZE = 256;
+    constexpr int MAX_BLOCK_SIZE = 1024;
+    constexpr size_t MEMORY_ALIGNMENT = 256;
+}
 
 // CUDA utilities and device management
 class CudaDevice {
 private:
     static std::unique_ptr<CudaDevice> instance_;
+    static std::once_flag init_flag_;
+    
     int device_id_;
+    cudaDeviceProp device_prop_;
     
 #ifdef USE_CUDA
     cublasHandle_t cublas_handle_;
     cudnnHandle_t cudnn_handle_;
+    cudaStream_t default_stream_;
 #endif
+
+    CudaDevice(int device_id = 0) : device_id_(device_id) {
+#ifdef USE_CUDA
+        cublas_handle_ = nullptr;
+        cudnn_handle_ = nullptr;
+        default_stream_ = nullptr;
+        
+        CUDA_CHECK(cudaSetDevice(device_id_));
+        CUDA_CHECK(cudaGetDeviceProperties(&device_prop_, device_id_));
+        
+        // Initialize cuBLAS
+        CUBLAS_CHECK(cublasCreate(&cublas_handle_));
+        
+        // Initialize cuDNN
+        CUDNN_CHECK(cudnnCreate(&cudnn_handle_));
+        
+        // Create default stream
+        CUDA_CHECK(cudaStreamCreate(&default_stream_));
+        
+        // Set cuBLAS stream
+        CUBLAS_CHECK(cublasSetStream(cublas_handle_, default_stream_));
+#endif
+    }
 
 public:
     static CudaDevice& getInstance() {
-        if (!instance_) {
-            instance_ = std::make_unique<CudaDevice>();
-        }
+        std::call_once(init_flag_, []() {
+            instance_ = std::unique_ptr<CudaDevice>(new CudaDevice());
+        });
         return *instance_;
-    }
-    
-    CudaDevice(int device_id = 0) : device_id_(device_id) {
-#ifdef USE_CUDA
-        cudaSetDevice(device_id_);
-        
-        // Initialize cuBLAS
-        cublasStatus_t stat = cublasCreate(&cublas_handle_);
-        if (stat != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error("cuBLAS initialization failed");
-        }
-        
-        // Initialize cuDNN
-        cudnnStatus_t cudnn_stat = cudnnCreate(&cudnn_handle_);
-        if (cudnn_stat != CUDNN_STATUS_SUCCESS) {
-            throw std::runtime_error("cuDNN initialization failed");
-        }
-#endif
     }
     
     ~CudaDevice() {
 #ifdef USE_CUDA
+        if (default_stream_) cudaStreamDestroy(default_stream_);
         if (cublas_handle_) cublasDestroy(cublas_handle_);
         if (cudnn_handle_) cudnnDestroy(cudnn_handle_);
 #endif
     }
     
+    // Delete copy and move
+    CudaDevice(const CudaDevice&) = delete;
+    CudaDevice& operator=(const CudaDevice&) = delete;
+    CudaDevice(CudaDevice&&) = delete;
+    CudaDevice& operator=(CudaDevice&&) = delete;
+    
 #ifdef USE_CUDA
     cublasHandle_t getCublasHandle() { return cublas_handle_; }
     cudnnHandle_t getCudnnHandle() { return cudnn_handle_; }
+    cudaStream_t getDefaultStream() { return default_stream_; }
+    const cudaDeviceProp& getDeviceProperties() const { return device_prop_; }
 #endif
     
-    bool isAvailable() {
+    bool isAvailable() const {
 #ifdef USE_CUDA
         int device_count;
         cudaError_t error = cudaGetDeviceCount(&device_count);
@@ -67,29 +129,150 @@ public:
         return false;
 #endif
     }
+    
+    int getOptimalBlockSize(int size) const {
+#ifdef USE_CUDA
+        if (size < 128) return 128;
+        if (size < 256) return 256;
+        if (size < 512) return 512;
+        return CudaConfig::DEFAULT_BLOCK_SIZE;
+#else
+        return CudaConfig::DEFAULT_BLOCK_SIZE;
+#endif
+    }
 };
 
-// GPU Memory management
+// Memory pool for efficient GPU memory management
+class GpuMemoryPool {
+private:
+    struct Block {
+        void* ptr;
+        size_t size;
+        bool in_use;
+        
+        Block(void* p, size_t s) : ptr(p), size(s), in_use(false) {}
+    };
+    
+    std::vector<Block> blocks_;
+    size_t total_allocated_;
+    mutable std::mutex mutex_;
+    
+    static std::unique_ptr<GpuMemoryPool> instance_;
+    static std::once_flag init_flag_;
+    
+    GpuMemoryPool() : total_allocated_(0) {}
+    
+    static size_t alignSize(size_t size) {
+        return ((size + CudaConfig::MEMORY_ALIGNMENT - 1) / CudaConfig::MEMORY_ALIGNMENT) 
+               * CudaConfig::MEMORY_ALIGNMENT;
+    }
+
+public:
+    static GpuMemoryPool& getInstance() {
+        std::call_once(init_flag_, []() {
+            instance_ = std::unique_ptr<GpuMemoryPool>(new GpuMemoryPool());
+        });
+        return *instance_;
+    }
+    
+    ~GpuMemoryPool() {
+        cleanup();
+    }
+    
+    void* allocate(size_t size) {
+#ifdef USE_CUDA
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        size_t aligned_size = alignSize(size);
+        
+        // Look for suitable free block
+        for (auto& block : blocks_) {
+            if (!block.in_use && block.size >= aligned_size) {
+                block.in_use = true;
+                
+                // Split block if significantly larger
+                if (block.size > aligned_size * 2) {
+                    void* remaining_ptr = static_cast<char*>(block.ptr) + aligned_size;
+                    size_t remaining_size = block.size - aligned_size;
+                    block.size = aligned_size;
+                    blocks_.emplace_back(remaining_ptr, remaining_size);
+                }
+                
+                return block.ptr;
+            }
+        }
+        
+        // No suitable block found, allocate new memory
+        void* ptr;
+        CUDA_CHECK(cudaMalloc(&ptr, aligned_size));
+        
+        blocks_.emplace_back(ptr, aligned_size);
+        blocks_.back().in_use = true;
+        total_allocated_ += aligned_size;
+        
+        return ptr;
+#else
+        throw std::runtime_error("CUDA not available");
+#endif
+    }
+    
+    void deallocate(void* ptr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        for (auto& block : blocks_) {
+            if (block.ptr == ptr) {
+                block.in_use = false;
+                return;
+            }
+        }
+    }
+    
+    void cleanup() {
+#ifdef USE_CUDA
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        for (const auto& block : blocks_) {
+            cudaFree(block.ptr);
+        }
+        blocks_.clear();
+        total_allocated_ = 0;
+#endif
+    }
+    
+    size_t totalMemory() const { 
+        std::lock_guard<std::mutex> lock(mutex_);
+        return total_allocated_; 
+    }
+};
+
+// GPU Memory management with smart pointer support
 class GpuTensor {
 private:
     float* device_ptr_;
     std::vector<int> shape_;
     int size_;
     bool owns_data_;
+    bool use_memory_pool_;
     
 public:
-    GpuTensor() : device_ptr_(nullptr), size_(0), owns_data_(false) {}
+    GpuTensor() : device_ptr_(nullptr), size_(0), owns_data_(false), use_memory_pool_(false) {}
     
-    GpuTensor(const std::vector<int>& shape) : shape_(shape), owns_data_(true) {
+    GpuTensor(const std::vector<int>& shape, bool use_pool = true) 
+        : shape_(shape), owns_data_(true), use_memory_pool_(use_pool) {
         size_ = 1;
         for (int dim : shape_) size_ *= dim;
         
 #ifdef USE_CUDA
-        cudaError_t err = cudaMalloc(&device_ptr_, size_ * sizeof(float));
-        if (err != cudaSuccess) {
-            throw std::runtime_error("CUDA memory allocation failed: " + 
-                                   std::string(cudaGetErrorString(err)));
+        if (use_memory_pool_) {
+            device_ptr_ = static_cast<float*>(
+                GpuMemoryPool::getInstance().allocate(size_ * sizeof(float))
+            );
+        } else {
+            CUDA_CHECK(cudaMalloc(&device_ptr_, size_ * sizeof(float)));
         }
+        
+        // Initialize to zero
+        CUDA_CHECK(cudaMemset(device_ptr_, 0, size_ * sizeof(float)));
 #else
         throw std::runtime_error("CUDA not available");
 #endif
@@ -98,15 +281,24 @@ public:
     ~GpuTensor() {
         if (owns_data_ && device_ptr_) {
 #ifdef USE_CUDA
-            cudaFree(device_ptr_);
+            if (use_memory_pool_) {
+                GpuMemoryPool::getInstance().deallocate(device_ptr_);
+            } else {
+                cudaFree(device_ptr_);
+            }
 #endif
         }
     }
     
+    // Delete copy operations
+    GpuTensor(const GpuTensor&) = delete;
+    GpuTensor& operator=(const GpuTensor&) = delete;
+    
     // Move constructor and assignment
     GpuTensor(GpuTensor&& other) noexcept 
         : device_ptr_(other.device_ptr_), shape_(std::move(other.shape_)), 
-          size_(other.size_), owns_data_(other.owns_data_) {
+          size_(other.size_), owns_data_(other.owns_data_),
+          use_memory_pool_(other.use_memory_pool_) {
         other.device_ptr_ = nullptr;
         other.owns_data_ = false;
     }
@@ -115,13 +307,18 @@ public:
         if (this != &other) {
             if (owns_data_ && device_ptr_) {
 #ifdef USE_CUDA
-                cudaFree(device_ptr_);
+                if (use_memory_pool_) {
+                    GpuMemoryPool::getInstance().deallocate(device_ptr_);
+                } else {
+                    cudaFree(device_ptr_);
+                }
 #endif
             }
             device_ptr_ = other.device_ptr_;
             shape_ = std::move(other.shape_);
             size_ = other.size_;
             owns_data_ = other.owns_data_;
+            use_memory_pool_ = other.use_memory_pool_;
             
             other.device_ptr_ = nullptr;
             other.owns_data_ = false;
@@ -133,15 +330,13 @@ public:
     void copyFromCpu(const Tensor& cpu_tensor) {
 #ifdef USE_CUDA
         if (cpu_tensor.size() != size_) {
-            throw std::runtime_error("Size mismatch in copyFromCpu");
+            throw std::runtime_error("Size mismatch in copyFromCpu: expected " + 
+                                   std::to_string(size_) + ", got " + 
+                                   std::to_string(cpu_tensor.size()));
         }
         
-        cudaError_t err = cudaMemcpy(device_ptr_, cpu_tensor.data().data(), 
-                                   size_ * sizeof(float), cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            throw std::runtime_error("CUDA memcpy H2D failed: " + 
-                                   std::string(cudaGetErrorString(err)));
-        }
+        CUDA_CHECK(cudaMemcpy(device_ptr_, cpu_tensor.data().data(), 
+                             size_ * sizeof(float), cudaMemcpyHostToDevice));
 #endif
     }
     
@@ -149,15 +344,19 @@ public:
     void copyToCpu(Tensor& cpu_tensor) const {
 #ifdef USE_CUDA
         if (cpu_tensor.size() != size_) {
-            throw std::runtime_error("Size mismatch in copyToCpu");
+            throw std::runtime_error("Size mismatch in copyToCpu: expected " + 
+                                   std::to_string(size_) + ", got " + 
+                                   std::to_string(cpu_tensor.size()));
         }
         
-        cudaError_t err = cudaMemcpy(cpu_tensor.data().data(), device_ptr_, 
-                                   size_ * sizeof(float), cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess) {
-            throw std::runtime_error("CUDA memcpy D2H failed: " + 
-                                   std::string(cudaGetErrorString(err)));
-        }
+        CUDA_CHECK(cudaMemcpy(cpu_tensor.data().data(), device_ptr_, 
+                             size_ * sizeof(float), cudaMemcpyDeviceToHost));
+#endif
+    }
+    
+    void zero() {
+#ifdef USE_CUDA
+        CUDA_CHECK(cudaMemset(device_ptr_, 0, size_ * sizeof(float)));
 #endif
     }
     
@@ -178,7 +377,7 @@ __global__ void relu_forward_kernel(const float* input, float* output, int size)
 }
 
 __global__ void relu_backward_kernel(const float* input, const float* grad_output, 
-                                   float* grad_input, int size) {
+                                     float* grad_input, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         grad_input[idx] = input[idx] > 0.0f ? grad_output[idx] : 0.0f;
@@ -192,6 +391,15 @@ __global__ void sigmoid_forward_kernel(const float* input, float* output, int si
     }
 }
 
+__global__ void sigmoid_backward_kernel(const float* output, const float* grad_output,
+                                       float* grad_input, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float sig = output[idx];
+        grad_input[idx] = grad_output[idx] * sig * (1.0f - sig);
+    }
+}
+
 __global__ void tanh_forward_kernel(const float* input, float* output, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -199,8 +407,17 @@ __global__ void tanh_forward_kernel(const float* input, float* output, int size)
     }
 }
 
+__global__ void tanh_backward_kernel(const float* output, const float* grad_output,
+                                    float* grad_input, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float t = output[idx];
+        grad_input[idx] = grad_output[idx] * (1.0f - t * t);
+    }
+}
+
 __global__ void add_bias_kernel(float* output, const float* bias, 
-                              int batch_size, int features) {
+                                int batch_size, int features) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_size = batch_size * features;
     
@@ -211,53 +428,18 @@ __global__ void add_bias_kernel(float* output, const float* bias,
 }
 
 __global__ void mse_loss_kernel(const float* predictions, const float* targets,
-                              float* loss, int size) {
+                                float* loss, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         float diff = predictions[idx] - targets[idx];
-        atomicAdd(loss, diff * diff / size);
+        atomicAdd(loss, diff * diff);
     }
 }
 
-// Convolution kernel (simplified 2D convolution)
-__global__ void conv2d_forward_kernel(const float* input, const float* weight, 
-                                     const float* bias, float* output,
-                                     int batch_size, int in_channels, int out_channels,
-                                     int in_height, int in_width,
-                                     int out_height, int out_width,
-                                     int kernel_size, int stride, int padding) {
+__global__ void scale_kernel(float* data, float scale, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_outputs = batch_size * out_channels * out_height * out_width;
-    
-    if (idx < total_outputs) {
-        int w = idx % out_width;
-        int h = (idx / out_width) % out_height;
-        int oc = (idx / (out_width * out_height)) % out_channels;
-        int b = idx / (out_channels * out_height * out_width);
-        
-        float sum = 0.0f;
-        
-        for (int ic = 0; ic < in_channels; ++ic) {
-            for (int kh = 0; kh < kernel_size; ++kh) {
-                for (int kw = 0; kw < kernel_size; ++kw) {
-                    int ih = h * stride + kh - padding;
-                    int iw = w * stride + kw - padding;
-                    
-                    if (ih >= 0 && ih < in_height && iw >= 0 && iw < in_width) {
-                        int input_idx = b * (in_channels * in_height * in_width) +
-                                       ic * (in_height * in_width) + 
-                                       ih * in_width + iw;
-                        int weight_idx = oc * (in_channels * kernel_size * kernel_size) +
-                                        ic * (kernel_size * kernel_size) +
-                                        kh * kernel_size + kw;
-                        
-                        sum += input[input_idx] * weight[weight_idx];
-                    }
-                }
-            }
-        }
-        
-        output[idx] = sum + bias[oc];
+    if (idx < size) {
+        data[idx] *= scale;
     }
 }
 
@@ -269,86 +451,93 @@ public:
     static void relu_forward(const GpuTensor& input, GpuTensor& output) {
 #ifdef USE_CUDA
         int size = input.size();
-        int threads = 256;
+        auto& device = CudaDevice::getInstance();
+        int threads = device.getOptimalBlockSize(size);
         int blocks = (size + threads - 1) / threads;
         
-        relu_forward_kernel<<<blocks, threads>>>(input.data(), output.data(), size);
-        cudaDeviceSynchronize();
+        relu_forward_kernel<<<blocks, threads, 0, device.getDefaultStream()>>>(
+            input.data(), output.data(), size);
+        CUDA_CHECK(cudaStreamSynchronize(device.getDefaultStream()));
 #endif
     }
     
     static void relu_backward(const GpuTensor& input, const GpuTensor& grad_output,
-                            GpuTensor& grad_input) {
+                             GpuTensor& grad_input) {
 #ifdef USE_CUDA
         int size = input.size();
-        int threads = 256;
+        auto& device = CudaDevice::getInstance();
+        int threads = device.getOptimalBlockSize(size);
         int blocks = (size + threads - 1) / threads;
         
-        relu_backward_kernel<<<blocks, threads>>>(input.data(), grad_output.data(),
-                                                 grad_input.data(), size);
-        cudaDeviceSynchronize();
+        relu_backward_kernel<<<blocks, threads, 0, device.getDefaultStream()>>>(
+            input.data(), grad_output.data(), grad_input.data(), size);
+        CUDA_CHECK(cudaStreamSynchronize(device.getDefaultStream()));
 #endif
     }
     
+    static void sigmoid_forward(const GpuTensor& input, GpuTensor& output) {
+#ifdef USE_CUDA
+        int size = input.size();
+        auto& device = CudaDevice::getInstance();
+        int threads = device.getOptimalBlockSize(size);
+        int blocks = (size + threads - 1) / threads;
+        
+        sigmoid_forward_kernel<<<blocks, threads, 0, device.getDefaultStream()>>>(
+            input.data(), output.data(), size);
+        CUDA_CHECK(cudaStreamSynchronize(device.getDefaultStream()));
+#endif
+    }
+    
+    static void add_bias(GpuTensor& output, const GpuTensor& bias, 
+                        int batch_size, int features) {
+#ifdef USE_CUDA
+        int size = batch_size * features;
+        auto& device = CudaDevice::getInstance();
+        int threads = device.getOptimalBlockSize(size);
+        int blocks = (size + threads - 1) / threads;
+        
+        add_bias_kernel<<<blocks, threads, 0, device.getDefaultStream()>>>(
+            output.data(), bias.data(), batch_size, features);
+        CUDA_CHECK(cudaStreamSynchronize(device.getDefaultStream()));
+#endif
+    }
+    
+    // Matrix multiplication: C = alpha * A * B + beta * C
+    // A: [M, K], B: [K, N], C: [M, N]
     static void gemm(const GpuTensor& A, const GpuTensor& B, GpuTensor& C,
-                    bool transpose_A = false, bool transpose_B = false,
-                    float alpha = 1.0f, float beta = 0.0f) {
+                     bool transpose_A = false, bool transpose_B = false,
+                     float alpha = 1.0f, float beta = 0.0f) {
 #ifdef USE_CUDA
         auto& device = CudaDevice::getInstance();
         cublasHandle_t handle = device.getCublasHandle();
         
-        // Assuming A is [M, K], B is [K, N], C is [M, N]
         const auto& shape_A = A.shape();
         const auto& shape_B = B.shape();
-        const auto& shape_C = C.shape();
         
+        // Matrix dimensions (considering potential transpose)
         int M = transpose_A ? shape_A[1] : shape_A[0];
+        int K_A = transpose_A ? shape_A[0] : shape_A[1];
+        int K_B = transpose_B ? shape_B[1] : shape_B[0];
         int N = transpose_B ? shape_B[0] : shape_B[1];
-        int K = transpose_A ? shape_A[0] : shape_A[1];
+        
+        if (K_A != K_B) {
+            throw std::runtime_error("Matrix dimension mismatch in GEMM: K_A=" + 
+                                   std::to_string(K_A) + ", K_B=" + std::to_string(K_B));
+        }
+        int K = K_A;
         
         cublasOperation_t op_A = transpose_A ? CUBLAS_OP_T : CUBLAS_OP_N;
         cublasOperation_t op_B = transpose_B ? CUBLAS_OP_T : CUBLAS_OP_N;
         
-        cublasStatus_t stat = cublasSgemm(handle, op_B, op_A, N, M, K,
-                                        &alpha, B.data(), shape_B[0],
-                                        A.data(), shape_A[0],
-                                        &beta, C.data(), shape_C[0]);
+        // cuBLAS uses column-major, so we compute B^T * A^T = (A * B)^T
+        int lda = transpose_A ? M : K;
+        int ldb = transpose_B ? K : N;
+        int ldc = M;
         
-        if (stat != CUBLAS_STATUS_SUCCESS) {
-            throw std::runtime_error("cuBLAS GEMM operation failed");
-        }
-#endif
-    }
-    
-    static void conv2d_forward(const GpuTensor& input, const GpuTensor& weight,
-                             const GpuTensor& bias, GpuTensor& output,
-                             int stride = 1, int padding = 0) {
-#ifdef USE_CUDA
-        const auto& in_shape = input.shape();  // [batch, in_channels, height, width]
-        const auto& w_shape = weight.shape();  // [out_channels, in_channels, ker_h, ker_w]
-        const auto& out_shape = output.shape(); // [batch, out_channels, out_height, out_width]
-        
-        int batch_size = in_shape[0];
-        int in_channels = in_shape[1];
-        int in_height = in_shape[2];
-        int in_width = in_shape[3];
-        int out_channels = w_shape[0];
-        int kernel_size = w_shape[2]; // Assuming square kernels
-        int out_height = out_shape[2];
-        int out_width = out_shape[3];
-        
-        int total_outputs = batch_size * out_channels * out_height * out_width;
-        int threads = 256;
-        int blocks = (total_outputs + threads - 1) / threads;
-        
-        conv2d_forward_kernel<<<blocks, threads>>>(
-            input.data(), weight.data(), bias.data(), output.data(),
-            batch_size, in_channels, out_channels,
-            in_height, in_width, out_height, out_width,
-            kernel_size, stride, padding
-        );
-        
-        cudaDeviceSynchronize();
+        CUBLAS_CHECK(cublasSgemm(handle, op_A, op_B, M, N, K,
+                                &alpha, A.data(), lda,
+                                B.data(), ldb,
+                                &beta, C.data(), ldc));
 #endif
     }
 };
@@ -359,11 +548,12 @@ private:
     std::shared_ptr<GpuTensor> data_;
     std::shared_ptr<GpuTensor> grad_;
     bool requires_grad_;
-    bool on_gpu_;
 
 public:
+    GpuVariable() : requires_grad_(false) {}
+    
     GpuVariable(const std::vector<int>& shape, bool requires_grad = false)
-        : requires_grad_(requires_grad), on_gpu_(true) {
+        : requires_grad_(requires_grad) {
         data_ = std::make_shared<GpuTensor>(shape);
         if (requires_grad_) {
             grad_ = std::make_shared<GpuTensor>(shape);
@@ -371,17 +561,15 @@ public:
     }
     
     // Create from CPU tensor
-    static GpuVariable fromCpu(const Variable& cpu_var) {
-        GpuVariable gpu_var(cpu_var.data().shape(), cpu_var.requires_grad());
-        gpu_var.data_->copyFromCpu(cpu_var.data());
-        return gpu_var;
-    }
+    static GpuVariable fromCpu(const Variable& cpu_var);
     
     // Convert to CPU
-    Variable toCpu() const {
-        Tensor cpu_tensor(data_->shape());
-        data_->copyToCpu(cpu_tensor);
-        return Variable(cpu_tensor, requires_grad_);
+    Variable toCpu() const;
+    
+    void zero_grad() {
+        if (grad_) {
+            grad_->zero();
+        }
     }
     
     GpuTensor& data() { return *data_; }
@@ -390,8 +578,12 @@ public:
         if (!grad_) throw std::runtime_error("Gradient not available");
         return *grad_; 
     }
+    const GpuTensor& grad() const {
+        if (!grad_) throw std::runtime_error("Gradient not available");
+        return *grad_;
+    }
     bool requires_grad() const { return requires_grad_; }
-    bool is_on_gpu() const { return on_gpu_; }
+    bool has_data() const { return data_ != nullptr; }
 };
 
 // GPU-accelerated layers
@@ -402,82 +594,24 @@ private:
     int in_features_, out_features_;
 
 public:
-    GpuLinearLayer(int in_features, int out_features) 
-        : in_features_(in_features), out_features_(out_features),
-          weights_(std::vector<int>{in_features, out_features}, true),
-          bias_(std::vector<int>{out_features}, true) {
-        
-        // Initialize weights (copy from CPU initialized tensor)
-        Tensor cpu_weights({in_features, out_features});
-        cpu_weights.xavier_init();
-        weights_.data().copyFromCpu(cpu_weights);
-        
-        // Initialize bias to zero
-        Tensor cpu_bias({out_features});
-        std::fill(cpu_bias.data().begin(), cpu_bias.data().end(), 0.0f);
-        bias_.data().copyFromCpu(cpu_bias);
-    }
+    GpuLinearLayer(int in_features, int out_features);
     
     GpuVariable forward(const GpuVariable& input) {
-        // Create output tensor
-        const auto& in_shape = input.data().shape();
-        GpuVariable output(std::vector<int>{in_shape[0], out_features_}, true);
+        if (!input.has_data()) {
+            throw std::runtime_error("Input has no data");
+        }
         
-        // Perform matrix multiplication using cuBLAS
+        const auto& in_shape = input.data().shape();
+        int batch_size = in_shape[0];
+        
+        // Create output tensor [batch_size, out_features]
+        GpuVariable output(std::vector<int>{batch_size, out_features_}, true);
+        
+        // Perform matrix multiplication: output = input * weights
         GpuOps::gemm(input.data(), weights_.data(), output.data());
         
-        // Add bias (would need a proper bias addition kernel)
-        // For now, simplified - in practice you'd use a CUDA kernel
-        
-        return output;
-    }
-    
-    std::vector<GpuVariable*> parameters() {
-        return {&weights_, &bias_};
-    }
-};
-
-// GPU-accelerated Conv2D layer
-class GpuConv2DLayer {
-private:
-    GpuVariable weights_;
-    GpuVariable bias_;
-    int in_channels_, out_channels_, kernel_size_, stride_, padding_;
-
-public:
-    GpuConv2DLayer(int in_channels, int out_channels, int kernel_size,
-                   int stride = 1, int padding = 0)
-        : in_channels_(in_channels), out_channels_(out_channels),
-          kernel_size_(kernel_size), stride_(stride), padding_(padding),
-          weights_(std::vector<int>{out_channels, in_channels, kernel_size, kernel_size}, true),
-          bias_(std::vector<int>{out_channels}, true) {
-        
-        // Initialize weights
-        Tensor cpu_weights({out_channels, in_channels, kernel_size, kernel_size});
-        float fan_in = in_channels * kernel_size * kernel_size;
-        float std = std::sqrt(2.0f / fan_in);
-        cpu_weights.random_normal(0.0f, std);
-        weights_.data().copyFromCpu(cpu_weights);
-        
-        // Initialize bias
-        Tensor cpu_bias({out_channels});
-        std::fill(cpu_bias.data().begin(), cpu_bias.data().end(), 0.0f);
-        bias_.data().copyFromCpu(cpu_bias);
-    }
-    
-    GpuVariable forward(const GpuVariable& input) {
-        const auto& in_shape = input.data().shape();
-        int batch = in_shape[0];
-        int in_h = in_shape[2], in_w = in_shape[3];
-        
-        int out_h = (in_h + 2 * padding_ - kernel_size_) / stride_ + 1;
-        int out_w = (in_w + 2 * padding_ - kernel_size_) / stride_ + 1;
-        
-        GpuVariable output(std::vector<int>{batch, out_channels_, out_h, out_w}, true);
-        
-        // Perform convolution using custom CUDA kernel
-        GpuOps::conv2d_forward(input.data(), weights_.data(), bias_.data(), 
-                              output.data(), stride_, padding_);
+        // Add bias
+        GpuOps::add_bias(output.data(), bias_.data(), batch_size, out_features_);
         
         return output;
     }
@@ -493,126 +627,27 @@ private:
     bool use_gpu_;
     
 public:
-    MixedTrainer(bool use_gpu = true) : use_gpu_(use_gpu && CudaDevice::getInstance().isAvailable()) {}
-    
-    template<typename ModelType>
-    void train_step(ModelType& model, const Variable& input, const Variable& target,
-                   float learning_rate) {
-        if (use_gpu_) {
-            // Move to GPU
-            auto gpu_input = GpuVariable::fromCpu(input);
-            auto gpu_target = GpuVariable::fromCpu(target);
-            
-            // Forward pass on GPU
-            auto gpu_output = model.forward(gpu_input);
-            
-            // Compute loss (simplified)
-            auto cpu_output = gpu_output.toCpu();
-            auto loss = MSELoss::forward(cpu_output, target);
-            
-            // Backward pass (would need GPU implementation)
-            loss.backward();
-            
-            // Update weights on GPU
-            // model.update_weights_gpu(learning_rate);
-        } else {
-            // CPU training
-            auto output = model.forward(input);
-            auto loss = MSELoss::forward(output, target);
-            loss.backward();
-            model.update_weights(learning_rate);
+    MixedTrainer(bool use_gpu = true) 
+        : use_gpu_(use_gpu && CudaDevice::getInstance().isAvailable()) {
+        if (use_gpu && !use_gpu_) {
+            throw std::runtime_error("GPU requested but not available");
         }
     }
     
     bool using_gpu() const { return use_gpu_; }
-};
-
-// Memory pool for efficient GPU memory management
-class GpuMemoryPool {
-private:
-    std::vector<std::pair<void*, size_t>> free_blocks_;
-    std::vector<std::pair<void*, size_t>> used_blocks_;
-    size_t total_allocated_;
     
-    static std::unique_ptr<GpuMemoryPool> instance_;
-    
-public:
-    static GpuMemoryPool& getInstance() {
-        if (!instance_) {
-            instance_ = std::make_unique<GpuMemoryPool>();
-        }
-        return *instance_;
-    }
-    
-    void* allocate(size_t size) {
+    void synchronize() {
 #ifdef USE_CUDA
-        // Round up to nearest 256 bytes for alignment
-        size_t aligned_size = ((size + 255) / 256) * 256;
-        
-        // Look for suitable free block
-        for (auto it = free_blocks_.begin(); it != free_blocks_.end(); ++it) {
-            if (it->second >= aligned_size) {
-                void* ptr = it->first;
-                size_t block_size = it->second;
-                
-                free_blocks_.erase(it);
-                used_blocks_.emplace_back(ptr, aligned_size);
-                
-                // Split block if larger than needed
-                if (block_size > aligned_size) {
-                    void* remaining = static_cast<char*>(ptr) + aligned_size;
-                    free_blocks_.emplace_back(remaining, block_size - aligned_size);
-                }
-                
-                return ptr;
-            }
+        if (use_gpu_) {
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
-        
-        // No suitable block found, allocate new memory
-        void* ptr;
-        cudaError_t err = cudaMalloc(&ptr, aligned_size);
-        if (err != cudaSuccess) {
-            throw std::runtime_error("GPU memory allocation failed");
-        }
-        
-        used_blocks_.emplace_back(ptr, aligned_size);
-        total_allocated_ += aligned_size;
-        
-        return ptr;
-#else
-        throw std::runtime_error("CUDA not available");
 #endif
     }
-    
-    void deallocate(void* ptr) {
-        // Find and move from used to free blocks
-        for (auto it = used_blocks_.begin(); it != used_blocks_.end(); ++it) {
-            if (it->first == ptr) {
-                free_blocks_.emplace_back(it->first, it->second);
-                used_blocks_.erase(it);
-                return;
-            }
-        }
-    }
-    
-    void cleanup() {
-#ifdef USE_CUDA
-        for (const auto& block : free_blocks_) {
-            cudaFree(block.first);
-        }
-        for (const auto& block : used_blocks_) {
-            cudaFree(block.first);
-        }
-        free_blocks_.clear();
-        used_blocks_.clear();
-        total_allocated_ = 0;
-#endif
-    }
-    
-    size_t total_memory() const { return total_allocated_; }
 };
 
 // Initialize static members
 std::unique_ptr<CudaDevice> CudaDevice::instance_ = nullptr;
+std::once_flag CudaDevice::init_flag_;
 
 std::unique_ptr<GpuMemoryPool> GpuMemoryPool::instance_ = nullptr;
+std::once_flag GpuMemoryPool::init_flag_;
