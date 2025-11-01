@@ -5,7 +5,7 @@
 #include <cublas_v2.h>
 #include <cudnn.h>
 #endif
-
+  
 #include <memory>
 #include <stdexcept>
 
@@ -614,4 +614,5 @@ public:
 
 // Initialize static members
 std::unique_ptr<CudaDevice> CudaDevice::instance_ = nullptr;
+
 std::unique_ptr<GpuMemoryPool> GpuMemoryPool::instance_ = nullptr;
