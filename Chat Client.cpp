@@ -6,7 +6,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-
+   
 class ChatClient {
 private:
     int client_socket;
@@ -159,4 +159,5 @@ int main(int argc, char* argv[]) {
     
     std::cout << "Chat client terminated.\n";
     return 0;
+
 }
