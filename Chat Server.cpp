@@ -9,7 +9,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-
+  
 class ChatServer {
 private:
     int server_socket;
@@ -242,4 +242,5 @@ int main() {
     
     accept_thread.join();
     return 0;
+
 }
