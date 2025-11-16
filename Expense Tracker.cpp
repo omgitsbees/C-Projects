@@ -39,7 +39,7 @@
 #include <map>
 #include <algorithm>
 #include <numeric>
-
+  
 using namespace QtCharts;
 
 // Expense structure to hold expense data
@@ -796,5 +796,6 @@ int main(int argc, char *argv[]) {
     
     return app.exec();
 }
+
 
 #include "main.moc"
