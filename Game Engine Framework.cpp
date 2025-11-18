@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <thread>
 #include <cmath>
-
+ 
 // Forward declarations
 class Entity;
 class Component;
@@ -468,4 +468,5 @@ int main() {
     std::cout << "Average FPS: " << engine.getTimeManager().getFPS() << std::endl;
     
     return 0;
+
 }
