@@ -13,7 +13,7 @@
 #include <iomanip>
 #include <random>
 #include <cmath>
-
+ 
 using namespace std;
 using namespace chrono;
 
@@ -670,4 +670,5 @@ int main() {
     cout << "Position tracking: Real-time PnL calculation\n";
 
     return 0;
+
 }
