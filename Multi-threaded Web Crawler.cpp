@@ -11,7 +11,7 @@
 #include <regex>
 #include <fstream>
 #include <curl/curl.h>
-
+  
 class WebCrawler {
 private:
     // Thread synchronization
@@ -319,3 +319,4 @@ int main() {
     
     return 0;
 }
+
