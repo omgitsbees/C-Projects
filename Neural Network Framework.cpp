@@ -5,7 +5,7 @@
 #include <fstream>
 #include <random>
 #include <chrono>
-
+  
 // Implement Variable::backward()
 void Variable::backward() {
     if (!requires_grad_) return;
@@ -479,3 +479,4 @@ int main() {
     
     return 0;
 }
+
