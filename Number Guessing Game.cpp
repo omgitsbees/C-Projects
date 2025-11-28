@@ -2,7 +2,7 @@
 #include <random>
 #include <limits>
 #include <string>
-
+ 
 class NumberGuessingGame {
 private:
     int secretNumber;
@@ -173,4 +173,5 @@ int main() {
     
     std::cout << "Thanks for playing! See you next time!" << std::endl;
     return 0;
+
 }
