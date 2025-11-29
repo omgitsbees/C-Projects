@@ -5,7 +5,7 @@ MEMINFO  equ  1 << 1
 FLAGS    equ  MBALIGN | MEMINFO
 MAGIC    equ  0x1BADB002
 CHECKSUM equ -(MAGIC + FLAGS)
-
+ 
 section .multiboot
 align 4
     dd MAGIC
@@ -369,5 +369,6 @@ debug: kernel.iso
 clean:
 	rm -f $(OBJECTS) kernel.elf kernel.iso
 	rm -rf isodir
+
 
 .PHONY: all run debug clean
