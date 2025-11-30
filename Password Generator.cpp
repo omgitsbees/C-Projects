@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <vector>
 #include <cctype>
-
+ 
 class PasswordGenerator {
 private:
     std::mt19937 rng;
@@ -274,4 +274,5 @@ int main() {
     PasswordGenerator generator;
     generator.run();
     return 0;
+
 }
