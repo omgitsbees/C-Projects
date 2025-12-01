@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <limits>
 #include <fstream>
-
+  
 // ============================================================================
 // MATH UTILITIES
 // ============================================================================
@@ -537,4 +537,5 @@ int main() {
     
     std::cout << "Image saved to output.ppm\n";
     return 0;
+
 }
