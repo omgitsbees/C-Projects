@@ -2,7 +2,7 @@
 #include <random>
 #include <string>
 #include <cctype>
-
+ 
 class RockPaperScissors {
 private:
     int playerScore;
@@ -168,4 +168,5 @@ int main() {
     RockPaperScissors game;
     game.playGame();
     return 0;
+
 }
