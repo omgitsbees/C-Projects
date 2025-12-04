@@ -6,7 +6,7 @@
 #include <string>
 #include <algorithm>
 #include <filesystem>
-
+ 
 // Data types supported by our database
 enum class DataType {
     INTEGER,
@@ -549,4 +549,5 @@ int main() {
     }
     
     return 0;
+
 }
